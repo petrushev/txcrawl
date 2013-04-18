@@ -1,151 +1,143 @@
-from sys import stderr
-
 from twisted.internet import reactor
-from twisted.internet.defer import Deferred
 from twisted.internet.protocol import Protocol
-from twisted.web.client import Agent
+from twisted.web.client import Agent, HTTPConnectionPool
 from twisted.web.http_headers import Headers
+from twisted.python import log
 
-agent = Agent(reactor)
+pool = HTTPConnectionPool(reactor, persistent=False)
 
-class Client(object):
+class BasicHTTPClientProtocol(object):
 
-    def __init__(self, url, headers = None):
-        self.url = url
-        self.method = 'GET'
+    def __init__(self, url, headers=None, wait=False):
         if headers is None:
             headers = {}
-        self.headers = headers
 
-        self._response = None
-        self._response_body = None
+        self._url = url
+        self._requestHeaders = Headers(headers)
+        self._responseHeaders = None
+        self._responseBody = None
+        self._responseCode = None
+
+        if not wait:
+            self.run()
 
     @property
-    def _request_headers(self):
-        return Headers(self.headers)
+    def url(self):
+        return self._url
+
+    @property
+    def requestHeaders(self):
+        return self._requestHeaders
 
     @property
     def responseHeaders(self):
-        return tuple(self._response.headers.getAllRawHeaders())
-
-    @property
-    def response(self):
-        return self._response
+        return self._responseHeaders
 
     @property
     def responseBody(self):
-        return self._response_body
+        return self._responseBody
+
+    def responseCode(self):
+        return self._responseCode
 
     def run(self):
-        self._response = None
-        self._response_body = None
+        self._responseHeaders = None
+        self._responseBody = None
 
-        self._main_deffered = agent.request(self.method, self.url, self._request_headers, None)
-        self._main_deffered.addCallback(self._receive)
-        self._main_deffered.addErrback(self._error)
+        agent = Agent(reactor, pool=pool)
+        d = agent.request('GET', self.url, self.requestHeaders, None)
+        d.addCallback(self._receive)
+        d.addErrback(self._error)
 
-    def _error(self, error):
-        stderr.write('err: %s\n' % error.getErrorMessage())
-
-    def _body_receiver_error(self, error):
-        msg = error.getErrorMessage().strip()
+    def _error(self, exception):
+        #exception.printTraceback()
+        msg = exception.getErrorMessage()
         if msg!='':
-            stderr.write('err: %s\n' % msg)
-        pass
+            log.err('%s @ %s: %s' % (self.__class__.__name__, self.url, msg))
 
     def _receive(self, response):
-        """Response received """
-        self._response = response
-        self.received()
+        self._responseHeaders = dict(response.headers.getAllRawHeaders())
+        self._responseCode = response.code
+        self.headersReceived()
 
-        self._receive_body()
+        self._receiveBody(response)
 
-    def _receive_body(self):
-        """Start receiving the body"""
+    def _receiveBody(self, response):
+        protocol = self
+        def dataReceived(chunk):
+            protocol._responseBody = protocol._responseBody + chunk
+        def connectionLost(_):
+            protocol.responseComplete()
 
-        parent_self = self
-        def dataReceived( chunk):
-            parent_self._chunk_received(chunk)
-        def connectionLost( error):
-            parent_self._body_receiver_error(error)
-            self._bodyFinished()
+        self._responseBody = ''
+        bodyReceiver = Protocol()
+        bodyReceiver.dataReceived = dataReceived
+        bodyReceiver.connectionLost = connectionLost
 
-        self._response_body = ''
-        body_receiver = Protocol()
-        body_receiver.dataReceived = dataReceived
-        body_receiver.connectionLost = connectionLost
+        response.deliverBody(bodyReceiver)
 
-        self._response.deliverBody(body_receiver)
+    #public event handlers
 
-    def _chunk_received(self, chunk):
-        self._response_body = self._response_body + chunk
-        self.chunkReceived(chunk)
-
-
-    def _bodyFinished(self):
-        """Body received"""
-        self.bodyFinished()
-
-    # handlers
-    def received(self):
-        """Fired after the response is received, but before the body"""
+    def headersReceived(self):
+        """Called when all response headers are received"""
         pass
 
-    def bodyFinished(self):
-        """Fired when the body is completed"""
+    def responseComplete(self):
+        """Called when the response is complete with its body"""
         pass
-
-    def chunkReceived(self, chunk):
-        """Fire after each body chunk is received,
-        useful for progress if response length is available"""
-        pass
-
 
 class RedirectError(Exception): pass
 
-class CommonClient(Client):
+class CommonHTTPClientProtocol(BasicHTTPClientProtocol):
 
     # contains memo for responses with permanent rediretion
-    _redirect_registry = {}
+    _redirectRegistry = {}
 
     # contains all url passed in redirection
-    history = tuple()
+    history = []
 
-    def _bodyFinished(self):
-        self.finished()
+    def run(self):
+        # check for permanent redirects
+        url = self.url
+        while url in self._redirectRegistry:
+            self.history.append(url)
+            newUrl = self._redirectRegistry[url]
+            self.redirect(url, newUrl)
+            url = newUrl
+
+        self._url = url
+
+        BasicHTTPClientProtocol.run(self)
 
     def _receive(self, response):
-        self._response = response
+        self._responseHeaders = dict(response.headers.getAllRawHeaders())
+        self._responseCode = response.code
+        self.headersReceived()
 
-        code = response.code
-
-        if code==302 or code==301:
+        if response.code==302 or response.code==301:
             # don't receive body if redirect
             try:
                 location = dict(self.responseHeaders)['Location'][0]
             except (KeyError, IndexError):
                 raise RedirectError, 'Location not announced'
 
-            self.history = self.history + (self.url,)
-            self.redirected(self.url, location)
+            url = self.url
+            if url in self.history:
+                raise RedirectError, 'Circular reference: '+' -> '.join(self.history) + ' -> ' + url
+            self.history.append(url)
+            self.redirected(url, location)
 
-            if code==301:
-                self.__class__._redirect_registry[self.url]=location
+            if response.code==301:
+                self.__class__._redirectRegistry[self.url]=location
 
-            self.url = location
-
+            self._url = location
             self.run()
 
         else:
-            self._receive_body()
+            self._receiveBody(response)
 
-
-    # handlers
-    def finished(self):
-        """Implement to be fired when the request body is received,
-        If there is a redirection, it fires on the last response"""
-        pass
+    #public event handlers
 
     def redirected(self, from_, to_):
-        """Implement to be fired on each redirection, but before sending the new request"""
+        """Called each time redirection occures"""
         pass

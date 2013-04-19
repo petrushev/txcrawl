@@ -37,6 +37,7 @@ class BasicHTTPClientProtocol(object):
     def responseBody(self):
         return self._responseBody
 
+    @property
     def responseCode(self):
         return self._responseCode
 
